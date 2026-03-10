@@ -1,0 +1,22 @@
+# Third-party dependency (cloned, not our code)
+mujoco_playground/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Training artifacts (too large for git)
+results/checkpoints/
+results/**/*.ckpt
+*.mp4
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# W&B
+wandb/
