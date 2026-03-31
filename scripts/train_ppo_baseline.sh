@@ -58,6 +58,7 @@ for SEED in "${SEEDS[@]}"; do
         --num_timesteps "$NUM_TIMESTEPS" \
         --num_envs "$NUM_ENVS" \
         --seed "$SEED" \
+        --use_tb True \
         --suffix "baseline_seed${SEED}"
 
     echo ""
