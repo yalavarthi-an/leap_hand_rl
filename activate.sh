@@ -4,6 +4,7 @@
 
 # Set JAX precision (only affects this terminal session)
 export JAX_DEFAULT_MATMUL_PRECISION=highest
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_FLAGS="--xla_gpu_triton_gemm_any=true"
 
 # Move into the project

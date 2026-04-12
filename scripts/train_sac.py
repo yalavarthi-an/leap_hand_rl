@@ -1,705 +1,411 @@
 """
-train_sac.py — Soft Actor-Critic for MuJoCo Playground (MJX).
-
-A complete JAX/Flax implementation of SAC adapted for GPU-parallel
-MJX environments, specifically LeapCubeReorient.
-
-Key design decisions:
-  - All networks are Flax Linen modules (JAX-native neural networks)
-  - Replay buffer stored as JAX arrays on GPU (fast sampling)
-  - Environment stepped via jax.vmap for parallel data collection
-  - Automatic entropy temperature (alpha) tuning
-  - Twin Q-networks to prevent overestimation
+train_sac.py — SAC Training for MuJoCo Playground using Brax's JIT-compiled SAC.
 
 Usage:
   cd ~/leap_hand_rl/mujoco_playground
-  uv --no-config run python ../scripts/train_sac.py --seed 0
+  uv --no-config run python ../scripts/train_sac.py --seed 0 --num_timesteps 5000000
 
 Author: Anish Yalavarthi (CS 5180 Project)
 """
 
+import datetime
+import functools
+import json
 import os
 import time
-import json
-import argparse
-from datetime import datetime
-from functools import partial
+import warnings
 
-# --- JAX ecosystem ---
-# jax: core library (jit, vmap, grad)
-# jax.numpy: GPU-accelerated NumPy replacement
-# flax.linen: neural network library for JAX (like PyTorch's nn.Module)
-# optax: gradient-based optimizers for JAX (Adam, SGD, etc.)
+from absl import app
+from absl import flags
+from absl import logging
+
+from brax.training.agents.sac import networks as sac_networks
+from brax.training.agents.sac import train as sac
+
+from etils import epath
 import jax
-import jax.numpy as jnp
-import flax.linen as nn
-import optax
-from flax.training.train_state import TrainState
-
-# --- MuJoCo Playground ---
+import jax.numpy as jp
+import mediapy as media
+from ml_collections import config_dict
+import mujoco
+import mujoco_playground
 from mujoco_playground import registry
+from mujoco_playground import wrapper
 
-# =========================================================================
-# Configuration
-# =========================================================================
+try:
+    import tensorboardX
+except ImportError:
+    tensorboardX = None
 
-def parse_args():
-    p = argparse.ArgumentParser(description="SAC for LeapCubeReorient")
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
-    # Experiment
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--run_name", type=str, default=None)
-    p.add_argument("--log_dir", type=str, default="./logs")
+xla_flags = os.environ.get("XLA_FLAGS", "")
+xla_flags += " --xla_gpu_triton_gemm_any=True"
+os.environ["XLA_FLAGS"] = xla_flags
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["MUJOCO_GL"] = "egl"
 
-    # Environment
-    p.add_argument("--env_name", type=str, default="LeapCubeReorient")
-    p.add_argument("--num_envs", type=int, default=256,
-                   help="Parallel envs for data collection (less than PPO — "
-                        "SAC relies on replay buffer, not massive parallelism)")
-    p.add_argument("--episode_length", type=int, default=1000)
-
-    # SAC hyperparameters
-    p.add_argument("--total_timesteps", type=int, default=50_000_000)
-    p.add_argument("--learning_rate", type=float, default=3e-4,
-                   help="Adam LR for actor, critic, and alpha")
-    p.add_argument("--buffer_size", type=int, default=1_000_000,
-                   help="Replay buffer capacity. 1M transitions ≈ 138 MB on GPU")
-    p.add_argument("--batch_size", type=int, default=256,
-                   help="Minibatch size sampled from replay buffer each update")
-    p.add_argument("--gamma", type=float, default=0.99,
-                   help="Discount factor — same as PPO baseline for fair comparison")
-    p.add_argument("--tau", type=float, default=0.005,
-                   help="Soft update coefficient: target = (1-τ)×target + τ×current")
-    p.add_argument("--learning_starts", type=int, default=25000,
-                   help="Random exploration steps before first gradient update. "
-                        "Fills buffer with diverse initial experiences.")
-    p.add_argument("--policy_frequency", type=int, default=2,
-                   help="Update actor every N critic updates (delayed policy update)")
-    p.add_argument("--target_entropy_scale", type=float, default=1.0,
-                   help="Multiplier for target entropy. 1.0 = standard -dim(A)")
-
-    # Network architecture
-    p.add_argument("--hidden_dims", type=int, nargs="+", default=[256, 256],
-                   help="Hidden layer sizes for actor and critic networks")
-
-    # Logging
-    p.add_argument("--log_every", type=int, default=5000,
-                   help="Print metrics every N env steps")
-    p.add_argument("--eval_every", type=int, default=500_000,
-                   help="Run eval episodes every N env steps")
-    p.add_argument("--eval_episodes", type=int, default=10)
-    p.add_argument("--save_every", type=int, default=2_000_000)
-    p.add_argument("--use_tb", action="store_true", help="Enable TensorBoard logging")
-
-    args = p.parse_args()
-    if args.run_name is None:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.run_name = f"sac_{args.env_name}_s{args.seed}_{ts}"
-    return args
+logging.set_verbosity(logging.WARNING)
+warnings.filterwarnings("ignore", category=RuntimeWarning, module="jax")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="jax")
+warnings.filterwarnings("ignore", category=UserWarning, module="absl")
 
 
-# =========================================================================
-# Step 2: Actor Network (Gaussian Policy with Tanh Squashing)
-# =========================================================================
+# =====================================================================
+# Flags
+# =====================================================================
 
-class Actor(nn.Module):
-    """
-    Stochastic policy: obs → mean, log_std → sample action via reparameterization.
+_ENV_NAME = flags.DEFINE_string("env_name", "LeapCubeReorient", "Environment name")
+_IMPL = flags.DEFINE_enum("impl", "jax", ["jax", "warp"], "MJX implementation")
+_SUFFIX = flags.DEFINE_string("suffix", None, "Experiment name suffix")
+_SEED = flags.DEFINE_integer("seed", 0, "Random seed")
+_LOGDIR = flags.DEFINE_string("logdir", None, "Log directory")
 
-    Architecture:
-      obs (57) → Dense(256) → ReLU → Dense(256) → ReLU → mean (16), log_std (16)
-      action = tanh(mean + exp(log_std) × noise)
-
-    The tanh squashing bounds actions to [-1, 1], which gets scaled to
-    the environment's action range. The log_prob correction accounts for
-    the change of variables from Gaussian to tanh-squashed distribution.
-    """
-    action_dim: int
-    hidden_dims: tuple = (256, 256)
-    LOG_STD_MIN: float = -20.0  # Prevents std from collapsing to 0
-    LOG_STD_MAX: float = 2.0    # Prevents std from exploding
-
-    @nn.compact
-    def __call__(self, obs):
-        # Shared hidden layers
-        x = obs
-        for dim in self.hidden_dims:
-            x = nn.Dense(dim)(x)
-            x = nn.relu(x)
-
-        # Two output heads: mean and log_std
-        mean = nn.Dense(self.action_dim)(x)
-        log_std = nn.Dense(self.action_dim)(x)
-
-        # Clamp log_std to prevent numerical issues
-        # Without this, std could become 0 (deterministic, no gradients)
-        # or infinity (pure noise, no learning)
-        log_std = jnp.clip(log_std, self.LOG_STD_MIN, self.LOG_STD_MAX)
-
-        return mean, log_std
+_NUM_TIMESTEPS = flags.DEFINE_integer("num_timesteps", 50_000_000, "Total timesteps")
+_NUM_ENVS = flags.DEFINE_integer("num_envs", 128, "Parallel environments")
+_EPISODE_LENGTH = flags.DEFINE_integer("episode_length", 1000, "Episode length")
+_LEARNING_RATE = flags.DEFINE_float("learning_rate", 3e-4, "Learning rate")
+_DISCOUNTING = flags.DEFINE_float("discounting", 0.99, "Discount factor")
+_BATCH_SIZE = flags.DEFINE_integer("batch_size", 256, "Minibatch size")
+_REWARD_SCALING = flags.DEFINE_float("reward_scaling", 1.0, "Reward scaling")
+_GRAD_UPDATES_PER_STEP = flags.DEFINE_float("grad_updates_per_step", 1.0, "UTD ratio")
+_MAX_REPLAY_SIZE = flags.DEFINE_integer("max_replay_size", 1048576, "Buffer capacity")
+_MIN_REPLAY_SIZE = flags.DEFINE_integer("min_replay_size", 8192, "Warmup transitions")
+_NORMALIZE_OBSERVATIONS = flags.DEFINE_boolean("normalize_observations", True, "Normalize obs")
+_NUM_EVALS = flags.DEFINE_integer("num_evals", 20, "Eval points during training")
+_NUM_VIDEOS = flags.DEFINE_integer("num_videos", 1, "Videos after training")
+_ACTION_REPEAT = flags.DEFINE_integer("action_repeat", 1, "Action repeat")
+_TAU = flags.DEFINE_float("tau", 0.005, "Target network update rate")
+_HIDDEN_LAYER_SIZES = flags.DEFINE_list("hidden_layer_sizes", [256, 256, 256], "Network sizes")
+_OBS_KEY = flags.DEFINE_string("obs_key", "state", "Obs key: 'state' or 'privileged_state'")
+_USE_WANDB = flags.DEFINE_boolean("use_wandb", False, "W&B logging")
+_USE_TB = flags.DEFINE_boolean("use_tb", True, "TensorBoard logging")
+_DOMAIN_RANDOMIZATION = flags.DEFINE_boolean("domain_randomization", False, "Domain rand")
 
 
-def sample_action(actor_params, actor, obs, key):
-    """
-    Sample action using the reparameterization trick.
+# =====================================================================
+# FlatObsMjxEnv — Wraps the BASE environment to flatten dict observations
+#
+# WHY AT THE BASE LEVEL:
+#   Brax's training wrappers (AutoReset, ActionRepeat, Episode) use
+#   jax.lax.scan internally. Scan requires the state pytree structure
+#   to be identical between input and output. If reset() returns flat obs
+#   but the inner env's step() returns dict obs, scan crashes.
+#
+#   By wrapping the base MjxEnv BEFORE Brax's wrappers are applied,
+#   every level of the wrapper stack sees flat observations consistently.
+#
+# WRAPPING ORDER:
+#   MjxEnv (LeapCubeReorient)        → returns dict obs
+#     ↓
+#   FlatObsMjxEnv(obs_key='state')   → returns flat obs (57,)
+#     ↓
+#   wrap_for_brax_training()          → adds AutoReset, Episode tracking
+#     ↓
+#   Brax SAC train()                  → sees flat obs everywhere ✓
+# =====================================================================
 
-    Instead of sampling directly from the policy (which blocks gradients),
-    we sample noise ~ N(0,1) and transform it:
-      action = tanh(mean + std × noise)
+class FlatObsMjxEnv:
+    """Wraps a Playground MjxEnv to return flat observations from one key."""
 
-    This lets gradients flow through the sampling process because the
-    randomness (noise) is external to the computation graph.
+    def __init__(self, env, obs_key="state"):
+        self._env = env
+        self._obs_key = obs_key
 
-    Also computes log_prob with the tanh correction:
-      log π(a|s) = log N(u|mean, std) - Σ log(1 - tanh²(u))
+    @property
+    def observation_size(self):
+        """Return int observation size for the selected key."""
+        orig = self._env.observation_size
+        if isinstance(orig, dict):
+            size = orig[self._obs_key]
+            if isinstance(size, (tuple, list)):
+                return int(size[0])
+            return int(size)
+        if isinstance(orig, (tuple, list)):
+            return int(orig[0])
+        return int(orig)
 
-    The correction term accounts for the Jacobian of the tanh transformation.
-    Without it, the entropy estimates would be wrong and α tuning would fail.
-    """
-    mean, log_std = actor.apply(actor_params, obs)
-    std = jnp.exp(log_std)
+    @property
+    def action_size(self):
+        size = self._env.action_size
+        if isinstance(size, (tuple, list)):
+            return int(size[0])
+        return int(size)
 
-    # Reparameterization trick
-    noise = jax.random.normal(key, mean.shape)
-    u = mean + std * noise          # Pre-squash action (Gaussian)
-    action = jnp.tanh(u)            # Squashed action in [-1, 1]
+    def reset(self, rng):
+        """Reset and extract selected obs key."""
+        state = self._env.reset(rng)
+        if isinstance(state.obs, dict):
+            return state.replace(obs=state.obs[self._obs_key])
+        return state
 
-    # Log probability with tanh correction
-    # Step 1: log prob under Gaussian
-    log_prob = -0.5 * (((u - mean) / (std + 1e-8)) ** 2 + 2 * log_std + jnp.log(2 * jnp.pi))
-    log_prob = log_prob.sum(axis=-1)  # Sum across action dimensions
+    def step(self, state, action):
+        """Step and extract selected obs key.
 
-    # Step 2: Subtract log-determinant of tanh Jacobian
-    # This is the "squashing correction" — mathematically derived from
-    # the change of variables formula for probability distributions
-    log_prob -= jnp.sum(jnp.log(1 - action ** 2 + 1e-6), axis=-1)
-
-    return action, log_prob
-
-
-# =========================================================================
-# Step 3: Twin Critic Networks (Q-functions)
-# =========================================================================
-
-class TwinCritic(nn.Module):
-    """
-    Twin Q-networks: (obs, action) → Q₁, Q₂
-
-    Both Q-networks share the same architecture but have INDEPENDENT weights.
-    They're defined in one module for convenience, but trained independently.
-
-    Input: obs (57) concatenated with action (16) = 73 dimensions
-    Output: Two scalar Q-values
-
-    Architecture per Q-network:
-      (obs, action) (73) → Dense(256) → ReLU → Dense(256) → ReLU → Q-value (1)
-    """
-    hidden_dims: tuple = (256, 256)
-
-    @nn.compact
-    def __call__(self, obs, action):
-        # Concatenate state and action — this is what makes it Q(s,a)
-        # not V(s) like PPO's critic
-        x = jnp.concatenate([obs, action], axis=-1)
-
-        # Q-network 1
-        q1 = x
-        for dim in self.hidden_dims:
-            q1 = nn.Dense(dim)(q1)
-            q1 = nn.relu(q1)
-        q1 = nn.Dense(1)(q1).squeeze(-1)  # (batch,) not (batch, 1)
-
-        # Q-network 2 (independent weights due to separate Dense layers)
-        q2 = x
-        for dim in self.hidden_dims:
-            q2 = nn.Dense(dim)(q2)
-            q2 = nn.relu(q2)
-        q2 = nn.Dense(1)(q2).squeeze(-1)
-
-        return q1, q2
-
-
-# =========================================================================
-# Step 4: Replay Buffer (GPU-Resident)
-# =========================================================================
-
-class ReplayBuffer:
-    """
-    Fixed-size circular buffer stored as JAX arrays on GPU.
-
-    Unlike PPO which discards data after each update, SAC stores ALL
-    transitions and samples random minibatches for learning. This is
-    the key to SAC's sample efficiency.
-
-    Memory layout (for 1M capacity, LeapCubeReorient):
-      obs:      (1_000_000, 57)  ← 57 MB
-      actions:  (1_000_000, 16)  ← 16 MB
-      rewards:  (1_000_000,)     ← 4 MB
-      next_obs: (1_000_000, 57)  ← 57 MB
-      dones:    (1_000_000,)     ← 4 MB
-      Total:    ~138 MB on GPU
-
-    The buffer uses a circular pointer — when full, new data overwrites
-    the oldest transitions. This means the buffer always contains the
-    most recent 1M transitions.
-    """
-
-    def __init__(self, obs_dim: int, action_dim: int, capacity: int):
-        self.capacity = capacity
-        self.obs = jnp.zeros((capacity, obs_dim))
-        self.actions = jnp.zeros((capacity, action_dim))
-        self.rewards = jnp.zeros((capacity,))
-        self.next_obs = jnp.zeros((capacity, obs_dim))
-        self.dones = jnp.zeros((capacity,))
-        self.size = 0       # How many valid transitions are stored
-        self.ptr = 0        # Where to write next
-
-    def add_batch(self, obs, actions, rewards, next_obs, dones):
+        Note: The MjxEnv doesn't use state.obs as input — it recomputes
+        observations from the physics state. So passing in a state with
+        flat obs (from our reset/previous step) works correctly.
         """
-        Add a batch of transitions from parallel environments.
+        next_state = self._env.step(state, action)
+        if isinstance(next_state.obs, dict):
+            return next_state.replace(obs=next_state.obs[self._obs_key])
+        return next_state
 
-        All inputs are JAX arrays. obs shape: (num_envs, obs_dim), etc.
-        The batch is written starting at self.ptr, wrapping around if needed.
+    def __getattr__(self, name):
+        """Forward all other attribute access to the wrapped env.
+
+        This ensures Playground's wrapper can access env-specific attributes
+        like dt, sys, mj_model, reward, observation_size, etc.
         """
-        batch_size = obs.shape[0]
-        indices = (jnp.arange(batch_size) + self.ptr) % self.capacity
-
-        self.obs = self.obs.at[indices].set(obs)
-        self.actions = self.actions.at[indices].set(actions)
-        self.rewards = self.rewards.at[indices].set(rewards)
-        self.next_obs = self.next_obs.at[indices].set(next_obs)
-        self.dones = self.dones.at[indices].set(dones)
-
-        self.ptr = (self.ptr + batch_size) % self.capacity
-        self.size = min(self.size + batch_size, self.capacity)
-
-    def sample(self, key: jax.Array, batch_size: int):
-        """
-        Sample a random minibatch of transitions.
-
-        This is the core of off-policy learning — we sample uniformly
-        from ALL stored transitions, regardless of when they were collected
-        or which version of the policy generated them.
-        """
-        indices = jax.random.randint(key, (batch_size,), 0, self.size)
-        return (
-            self.obs[indices],
-            self.actions[indices],
-            self.rewards[indices],
-            self.next_obs[indices],
-            self.dones[indices],
-        )
+        return getattr(self._env, name)
 
 
-# =========================================================================
-# Step 5: SAC Update Functions (The Core Algorithm)
-# =========================================================================
+# =====================================================================
+# SAC Config
+# =====================================================================
 
-@jax.jit
-def update_critic(
-    critic_state,       # TrainState for twin critics
-    target_critic_params,  # Frozen target network parameters
-    actor_state,        # Current actor (for sampling next actions)
-    log_alpha,          # Current entropy temperature (log scale)
-    batch,              # (obs, actions, rewards, next_obs, dones)
-    gamma,              # Discount factor
-    key,                # PRNG key for sampling next actions
-):
-    """
-    Update twin Q-networks toward the TD target.
-
-    The target is:
-      y = r + γ × (1-done) × (min(Q₁_target, Q₂_target) - α × log π(a'|s'))
-
-    where a' is sampled from the CURRENT policy (not the one that collected the data).
-    """
-    obs, actions, rewards, next_obs, dones = batch
-    key, action_key = jax.random.split(key)
-
-    # Sample next actions from CURRENT policy
-    next_actions, next_log_probs = sample_action(
-        actor_state.params, actor_state.apply_fn, next_obs, action_key
-    )
-
-    # Compute target Q-values using TARGET networks (frozen, stable)
-    alpha = jnp.exp(log_alpha)
-    next_q1, next_q2 = critic_state.apply_fn.apply(
-        target_critic_params, next_obs, next_actions
-    )
-    next_q = jnp.minimum(next_q1, next_q2)  # Pessimistic estimate
-    next_q = next_q - alpha * next_log_probs  # Entropy bonus
-
-    # TD target: r + γ(1-done)(Q_target - α log π)
-    target_q = rewards + gamma * (1.0 - dones) * next_q
-
-    # Critic loss: MSE between predicted Q and target
-    def critic_loss_fn(critic_params):
-        q1, q2 = critic_state.apply_fn.apply(critic_params, obs, actions)
-        loss = 0.5 * (jnp.mean((q1 - target_q) ** 2) +
-                       jnp.mean((q2 - target_q) ** 2))
-        return loss, {"q1_mean": q1.mean(), "q2_mean": q2.mean(),
-                       "critic_loss": loss}
-
-    (loss, info), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
-        critic_state.params
-    )
-    critic_state = critic_state.apply_gradients(grads=grads)
-
-    return critic_state, info, key
+def get_sac_config(env_name, impl):
+    cfg = config_dict.ConfigDict()
+    cfg.num_timesteps = 50_000_000
+    cfg.num_envs = 128
+    cfg.episode_length = 1000
+    cfg.action_repeat = 1
+    cfg.learning_rate = 3e-4
+    cfg.discounting = 0.99
+    cfg.batch_size = 256
+    cfg.reward_scaling = 1.0
+    cfg.grad_updates_per_step = 1.0
+    cfg.tau = 0.005
+    cfg.max_replay_size = 1048576
+    cfg.min_replay_size = 8192
+    cfg.normalize_observations = True
+    cfg.num_evals = 20
+    cfg.network_factory = config_dict.ConfigDict({
+        "hidden_layer_sizes": [256, 256, 256],
+        "obs_key": "state",
+    })
+    return cfg
 
 
-@jax.jit
-def update_actor_and_alpha(
-    actor_state,        # TrainState for actor
-    critic_state,       # Current critic (for evaluating new actions)
-    log_alpha,          # Current log(α) — we optimize log(α) not α for stability
-    alpha_optimizer,    # Optax optimizer state for alpha
-    obs,                # Batch of observations
-    target_entropy,     # -dim(A) = -16
-    key,                # PRNG key
-):
-    """
-    Update the actor to maximize Q-value while maintaining entropy.
+# =====================================================================
+# Main
+# =====================================================================
 
-    Actor loss: E[ α × log π(a|s) - min(Q₁, Q₂) ]
-                    ^^^^^^^^^^^^^^   ^^^^^^^^^^^^^
-                    "stay random"    "get high Q"
+def main(argv):
+    del argv
 
-    We MINIMIZE this, so:
-      - Minimizing α×log_prob = maximizing entropy (more random)
-      - Minimizing -Q = maximizing Q (better actions)
-    """
-    key, action_key = jax.random.split(key)
-    alpha = jnp.exp(log_alpha)
+    env_cfg = registry.get_default_config(_ENV_NAME.value)
+    env_cfg["impl"] = _IMPL.value
 
-    # Actor loss
-    def actor_loss_fn(actor_params):
-        actions, log_probs = sample_action(
-            actor_params, actor_state.apply_fn, obs, action_key
-        )
-        q1, q2 = critic_state.apply_fn.apply(critic_state.params, obs, actions)
-        q_min = jnp.minimum(q1, q2)
+    sac_params = get_sac_config(_ENV_NAME.value, _IMPL.value)
 
-        # loss = E[α log π - Q]
-        loss = jnp.mean(alpha * log_probs - q_min)
-        return loss, {"actor_loss": loss, "mean_log_prob": log_probs.mean()}
+    # Apply overrides
+    if _NUM_TIMESTEPS.present: sac_params.num_timesteps = _NUM_TIMESTEPS.value
+    if _NUM_ENVS.present: sac_params.num_envs = _NUM_ENVS.value
+    if _EPISODE_LENGTH.present: sac_params.episode_length = _EPISODE_LENGTH.value
+    if _LEARNING_RATE.present: sac_params.learning_rate = _LEARNING_RATE.value
+    if _DISCOUNTING.present: sac_params.discounting = _DISCOUNTING.value
+    if _BATCH_SIZE.present: sac_params.batch_size = _BATCH_SIZE.value
+    if _REWARD_SCALING.present: sac_params.reward_scaling = _REWARD_SCALING.value
+    if _GRAD_UPDATES_PER_STEP.present: sac_params.grad_updates_per_step = _GRAD_UPDATES_PER_STEP.value
+    if _MAX_REPLAY_SIZE.present: sac_params.max_replay_size = _MAX_REPLAY_SIZE.value
+    if _MIN_REPLAY_SIZE.present: sac_params.min_replay_size = _MIN_REPLAY_SIZE.value
+    if _NORMALIZE_OBSERVATIONS.present: sac_params.normalize_observations = _NORMALIZE_OBSERVATIONS.value
+    if _NUM_EVALS.present: sac_params.num_evals = _NUM_EVALS.value
+    if _ACTION_REPEAT.present: sac_params.action_repeat = _ACTION_REPEAT.value
+    if _TAU.present: sac_params.tau = _TAU.value
+    if _HIDDEN_LAYER_SIZES.present:
+        sac_params.network_factory.hidden_layer_sizes = list(map(int, _HIDDEN_LAYER_SIZES.value))
+    if _OBS_KEY.present: sac_params.network_factory.obs_key = _OBS_KEY.value
 
-    (actor_loss, actor_info), actor_grads = jax.value_and_grad(
-        actor_loss_fn, has_aux=True
-    )(actor_state.params)
-    actor_state = actor_state.apply_gradients(grads=actor_grads)
+    # Load environment
+    env = registry.load(_ENV_NAME.value, config=env_cfg)
 
-    # Alpha (entropy temperature) loss
-    # If policy is too deterministic (log_prob > target_entropy):
-    #   → alpha_loss is positive → gradient pushes α up → more exploration
-    # If policy is too random (log_prob < target_entropy):
-    #   → alpha_loss is negative → gradient pushes α down → less exploration
-    def alpha_loss_fn(log_alpha_val):
-        return -jnp.mean(
-            log_alpha_val * (actor_info["mean_log_prob"] + target_entropy)
-        )
+    print(f"Environment Config:\n{env_cfg}")
+    print(f"\nSAC Training Parameters:\n{sac_params}")
 
-    alpha_loss, alpha_grad = jax.value_and_grad(alpha_loss_fn)(log_alpha)
-    alpha_updates, alpha_optimizer = optax.adam(3e-4).update(
-        alpha_grad, alpha_optimizer
-    )
-    log_alpha = optax.apply_updates(log_alpha, alpha_updates)
+    # Experiment name
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y%m%d-%H%M%S")
+    exp_name = f"SAC-{_ENV_NAME.value}-{timestamp}"
+    if _SUFFIX.value: exp_name += f"-{_SUFFIX.value}"
+    print(f"Experiment name: {exp_name}")
 
-    info = {**actor_info, "alpha": jnp.exp(log_alpha), "alpha_loss": alpha_loss}
-    return actor_state, log_alpha, alpha_optimizer, info, key
+    # Logging setup
+    logdir = epath.Path(_LOGDIR.value or "logs").resolve() / exp_name
+    logdir.mkdir(parents=True, exist_ok=True)
+    print(f"Logs: {logdir}")
 
+    ckpt_path = logdir / "checkpoints"
+    ckpt_path.mkdir(parents=True, exist_ok=True)
 
-@jax.jit
-def soft_update(target_params, online_params, tau):
-    """
-    Polyak averaging: slowly blend online params into target.
+    with open(ckpt_path / "config.json", "w", encoding="utf-8") as fp:
+        json.dump(env_cfg.to_dict(), fp, indent=4)
 
-    target = (1 - τ) × target + τ × online
-
-    With τ = 0.005, it takes ~1000 updates for the target to
-    approximately match the online network. This provides the
-    stable training targets that prevent Q-value divergence.
-    """
-    return jax.tree.map(
-        lambda t, o: (1 - tau) * t + tau * o,
-        target_params, online_params
-    )
-
-
-# =========================================================================
-# Step 6: MJX Environment Interface
-# =========================================================================
-
-def make_env(env_name):
-    """Load environment and get observation/action dimensions."""
-    env = registry.load(env_name)
-    key = jax.random.PRNGKey(0)
-    state = env.reset(key)
-    obs_dim = state.obs["state"].shape[-1]  # 57 for LeapCubeReorient
-    action_dim = env.action_size             # 16 for LeapCubeReorient
-    return env, obs_dim, action_dim
-
-
-# =========================================================================
-# Step 7: Training Loop
-# =========================================================================
-
-def train(args):
-    print("=" * 60)
-    print(f"  SAC Training — {args.env_name}")
-    print(f"  Seed: {args.seed}")
-    print(f"  Num envs: {args.num_envs}")
-    print(f"  Total timesteps: {args.total_timesteps:,}")
-    print(f"  Buffer size: {args.buffer_size:,}")
-    print(f"  Batch size: {args.batch_size}")
-    print(f"  Hidden dims: {args.hidden_dims}")
-    print(f"  LR: {args.learning_rate}, γ: {args.gamma}, τ: {args.tau}")
-    print("=" * 60)
-
-    # --- Setup ---
-    key = jax.random.PRNGKey(args.seed)
-    log_path = os.path.join(args.log_dir, args.run_name)
-    os.makedirs(log_path, exist_ok=True)
-
-    # Save config
-    with open(os.path.join(log_path, "config.json"), "w") as f:
-        json.dump(vars(args), f, indent=2)
-
-    # TensorBoard
     writer = None
-    if args.use_tb:
-        try:
-            import tensorboardX
-            writer = tensorboardX.SummaryWriter(log_path)
-        except ImportError:
-            print("WARNING: tensorboardX not installed, skipping TB logging")
+    if _USE_TB.value and tensorboardX is not None:
+        writer = tensorboardX.SummaryWriter(logdir)
 
-    # --- Load environment ---
-    print("\n[1/5] Loading environment...")
-    env, obs_dim, action_dim = make_env(args.env_name)
-    print(f"  Obs dim: {obs_dim}, Action dim: {action_dim}")
+    if _USE_WANDB.value:
+        if wandb is None: raise ImportError("wandb required")
+        wandb.init(project="mjxrl-sac", name=exp_name)
+        wandb.config.update(env_cfg.to_dict())
 
-    # --- Initialize networks ---
-    print("[2/5] Initializing networks...")
-    key, actor_key, critic_key = jax.random.split(key, 3)
+    # ============================================================
+    # Build training function
+    # ============================================================
 
-    # Actor
-    actor = Actor(action_dim=action_dim, hidden_dims=tuple(args.hidden_dims))
-    dummy_obs = jnp.zeros((1, obs_dim))
-    actor_params = actor.init(actor_key, dummy_obs)
-    actor_state = TrainState.create(
-        apply_fn=actor,
-        params=actor_params,
-        tx=optax.adam(args.learning_rate),
+    training_params = dict(sac_params)
+    del training_params["network_factory"]
+
+    # Ensure integer params stay as ints (ConfigDict can convert to float)
+    for key in ["batch_size", "num_envs", "num_timesteps", "episode_length",
+                "max_replay_size", "min_replay_size", "num_evals", "action_repeat",
+                "grad_updates_per_step", "tau"]:
+        if key in training_params:
+            training_params[key] = int(training_params[key])
+
+    obs_key = sac_params.network_factory.get("obs_key", "state")
+    hidden_sizes = list(map(int, sac_params.network_factory.get(
+        "hidden_layer_sizes", [256, 256, 256]
+    )))
+
+    network_factory = functools.partial(
+        sac_networks.make_sac_networks,
+        hidden_layer_sizes=hidden_sizes,
     )
 
-    # Twin Critic
-    critic = TwinCritic(hidden_dims=tuple(args.hidden_dims))
-    dummy_action = jnp.zeros((1, action_dim))
-    critic_params = critic.init(critic_key, dummy_obs, dummy_action)
-    critic_state = TrainState.create(
-        apply_fn=critic,
-        params=critic_params,
-        tx=optax.adam(args.learning_rate),
+    if _DOMAIN_RANDOMIZATION.value:
+        training_params["randomization_fn"] = registry.get_domain_randomizer(
+            _ENV_NAME.value
+        )
+
+    # ============================================================
+    # wrap_env_fn: Flatten obs at base level THEN apply Brax wrappers
+    # This is the key fix — flattening happens BEFORE jax.lax.scan
+    # ============================================================
+    def wrap_env_for_sac(env, **kwargs):
+        flat_env = FlatObsMjxEnv(env, obs_key=obs_key)
+        return wrapper.wrap_for_brax_training(flat_env, **kwargs)
+
+    train_fn = functools.partial(
+        sac.train,
+        **training_params,
+        network_factory=network_factory,
+        seed=_SEED.value,
+        wrap_env_fn=wrap_env_for_sac,
     )
-    target_critic_params = critic_params  # Initialize target = online
 
-    # Entropy temperature (α)
-    # We optimize log(α) instead of α for numerical stability
-    # (α must be positive; log(α) can be any real number)
-    target_entropy = -action_dim * args.target_entropy_scale  # -16.0
-    log_alpha = jnp.float32(0.0)  # α = exp(0) = 1.0 initially
-    alpha_opt_state = optax.adam(args.learning_rate).init(log_alpha)
+    # ============================================================
+    # Progress callback
+    # ============================================================
+    times = [time.monotonic()]
 
-    num_actor_params = sum(p.size for p in jax.tree.leaves(actor_params))
-    num_critic_params = sum(p.size for p in jax.tree.leaves(critic_params))
-    print(f"  Actor params: {num_actor_params:,}")
-    print(f"  Critic params: {num_critic_params:,}")
-    print(f"  Target entropy: {target_entropy}")
+    def progress(num_steps, metrics):
+        times.append(time.monotonic())
+        if _USE_TB.value and writer is not None:
+            for key, value in metrics.items():
+                writer.add_scalar(key, value, num_steps)
+            writer.flush()
+        if _USE_WANDB.value:
+            wandb.log(metrics, step=num_steps)
+        reward = metrics.get("eval/episode_reward", 0)
+        print(f"{num_steps}: reward={reward:.3f}")
 
-    # --- Replay buffer ---
-    print("[3/5] Creating replay buffer...")
-    buffer = ReplayBuffer(obs_dim, action_dim, args.buffer_size)
-    print(f"  Capacity: {args.buffer_size:,} transitions")
-    print(f"  Estimated GPU memory: ~{args.buffer_size * (obs_dim*2 + action_dim + 2) * 4 / 1e6:.0f} MB")
+    # ============================================================
+    # TRAIN
+    # ============================================================
+    print("\nStarting SAC training...")
+    print("JIT compilation will take 1-3 minutes...")
 
-    # --- Initialize parallel environments ---
-    print("[4/5] Compiling environment functions...")
-    key, env_key = jax.random.split(key)
+    make_inference_fn, params, _ = train_fn(
+        environment=env,
+        progress_fn=progress,
+    )
 
-    reset_fn = jax.jit(jax.vmap(env.reset))
-    step_fn = jax.jit(jax.vmap(env.step))
+    print("\nDone training.")
+    if len(times) > 1:
+        print(f"Time to JIT compile: {times[1] - times[0]:.1f}s")
+        print(f"Time to train: {times[-1] - times[1]:.1f}s")
 
-    env_keys = jax.random.split(env_key, args.num_envs)
-    env_state = reset_fn(env_keys)
-    obs = env_state.obs["state"]  # (num_envs, 57)
-    print(f"  {args.num_envs} environments ready. Obs shape: {obs.shape}")
+    # ============================================================
+    # Post-training video
+    # ============================================================
+    print("\nStarting inference...")
 
-    # --- Training loop ---
-    print("[5/5] Starting training...")
-    print(f"  Random exploration for first {args.learning_starts:,} steps")
-    print(f"  JIT compilation will happen on first update (~30s)")
-    print()
+    inference_fn = make_inference_fn(params, deterministic=True)
+    jit_inference_fn = jax.jit(inference_fn)
 
-    global_step = 0
-    total_updates = 0
-    start_time = time.time()
-    metrics_history = []
+    # Use FlatObsMjxEnv for inference too
+    infer_env_raw = registry.load(_ENV_NAME.value, config=env_cfg)
+    infer_env_flat = FlatObsMjxEnv(infer_env_raw, obs_key=obs_key)
+    wrapped_infer_env = wrapper.wrap_for_brax_training(
+        infer_env_flat,
+        episode_length=sac_params.episode_length,
+        action_repeat=sac_params.get("action_repeat", 1),
+    )
 
-    while global_step < args.total_timesteps:
-        key, action_key = jax.random.split(key)
+    rng = jax.random.split(jax.random.PRNGKey(_SEED.value), _NUM_VIDEOS.value)
+    reset_states = jax.jit(wrapped_infer_env.reset)(rng)
 
-        # --- Collect one step from all parallel environments ---
-        if global_step < args.learning_starts:
-            # Random exploration to fill buffer with diverse data
-            actions = jax.random.uniform(
-                action_key, (args.num_envs, action_dim), minval=-1.0, maxval=1.0
-            )
-        else:
-            # Sample from current policy
-            action_keys = jax.random.split(action_key, args.num_envs)
-            actions, _ = jax.vmap(
-                lambda o, k: sample_action(actor_state.params, actor, o, k)
-            )(obs, action_keys)
+    empty_data = reset_states.data.__class__(
+        **{k: None for k in reset_states.data.__annotations__}
+    )
+    empty_traj = reset_states.__class__(
+        **{k: None for k in reset_states.__annotations__}
+    )
+    empty_traj = empty_traj.replace(data=empty_data)
 
-        # Step all environments
-        next_env_state = step_fn(env_state, actions)
-        next_obs = next_env_state.obs["state"]
-        rewards = next_env_state.reward
-        dones = next_env_state.done
+    def step(carry, _):
+        state, rng = carry
+        rng, act_key = jax.random.split(rng)
+        act_keys = jax.random.split(act_key, _NUM_VIDEOS.value)
+        act = jax.vmap(jit_inference_fn)(state.obs, act_keys)[0]
+        state = wrapped_infer_env.step(state, act)
+        traj_data = empty_traj.tree_replace({
+            "data.qpos": state.data.qpos,
+            "data.qvel": state.data.qvel,
+            "data.time": state.data.time,
+            "data.ctrl": state.data.ctrl,
+            "data.mocap_pos": state.data.mocap_pos,
+            "data.mocap_quat": state.data.mocap_quat,
+            "data.xfrc_applied": state.data.xfrc_applied,
+        })
+        return (state, rng), traj_data
 
-        # Store transitions in replay buffer
-        buffer.add_batch(obs, actions, rewards, next_obs, dones)
+    @jax.jit
+    def do_rollout(state, rng):
+        _, traj = jax.lax.scan(step, (state, rng), None, length=sac_params.episode_length)
+        return traj
 
-        # Advance
-        obs = next_obs
-        env_state = next_env_state
-        global_step += args.num_envs
+    traj_stacked = do_rollout(reset_states, jax.random.PRNGKey(_SEED.value + 1))
+    traj_stacked = jax.tree.map(lambda x: jp.moveaxis(x, 0, 1), traj_stacked)
+    trajectories = [None] * _NUM_VIDEOS.value
+    for i in range(_NUM_VIDEOS.value):
+        t = jax.tree.map(lambda x, i=i: x[i], traj_stacked)
+        trajectories[i] = [jax.tree.map(lambda x, j=j: x[j], t) for j in range(sac_params.episode_length)]
 
-        # --- Update networks ---
-        if global_step >= args.learning_starts:
-            key, sample_key = jax.random.split(key)
-            batch = buffer.sample(sample_key, args.batch_size)
+    render_every = 2
+    fps = 1.0 / infer_env_raw.dt / render_every
+    print(f"FPS: {fps}")
+    scene_option = mujoco.MjvOption()
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = False
+    scene_option.flags[mujoco.mjtVisFlag.mjVIS_PERTFORCE] = False
 
-            # Update critic
-            critic_state, critic_info, key = update_critic(
-                critic_state, target_critic_params, actor_state,
-                log_alpha, batch, args.gamma, key
-            )
-            total_updates += 1
-
-            # Delayed actor + alpha update
-            if total_updates % args.policy_frequency == 0:
-                actor_state, log_alpha, alpha_opt_state, actor_info, key = (
-                    update_actor_and_alpha(
-                        actor_state, critic_state, log_alpha, alpha_opt_state,
-                        batch[0], target_entropy, key  # batch[0] = obs
-                    )
-                )
-
-                # Soft-update target networks
-                target_critic_params = soft_update(
-                    target_critic_params, critic_state.params, args.tau
-                )
-
-        # --- Logging ---
-        if global_step % args.log_every == 0 and global_step > args.learning_starts:
-            elapsed = time.time() - start_time
-            sps = global_step / elapsed
-            alpha_val = float(jnp.exp(log_alpha))
-
-            metrics = {
-                "step": global_step,
-                "critic_loss": float(critic_info["critic_loss"]),
-                "q1_mean": float(critic_info["q1_mean"]),
-                "q2_mean": float(critic_info["q2_mean"]),
-                "alpha": alpha_val,
-                "buffer_size": buffer.size,
-                "sps": sps,
-            }
-
-            if total_updates % args.policy_frequency == 0:
-                metrics["actor_loss"] = float(actor_info["actor_loss"])
-                metrics["mean_log_prob"] = float(actor_info["mean_log_prob"])
-
-            metrics_history.append(metrics)
-
-            # TensorBoard logging
-            if writer is not None:
-                for k, v in metrics.items():
-                    writer.add_scalar(k, v, global_step)
-                writer.flush()
-
-            print(
-                f"Step {global_step:>10,} | "
-                f"Critic {float(critic_info['critic_loss']):>8.3f} | "
-                f"Q1 {float(critic_info['q1_mean']):>7.1f} | "
-                f"α {alpha_val:>6.4f} | "
-                f"SPS {sps:>7,.0f} | "
-                f"Buf {buffer.size:>8,}"
-            )
-
-        # --- Periodic evaluation ---
-        if global_step % args.eval_every == 0 and global_step > 0:
-            eval_return = evaluate(env, actor_state, actor, key, args.eval_episodes)
-            mean_ret = float(eval_return.mean())
-            std_ret = float(eval_return.std())
-
-            if writer is not None:
-                writer.add_scalar("eval/episode_reward", mean_ret, global_step)
-                writer.flush()
-
-            print(f"  >>> EVAL step {global_step:,}: "
-                  f"reward = {mean_ret:.2f} ± {std_ret:.2f}")
-
-        # --- Save checkpoint ---
-        if global_step % args.save_every == 0 and global_step > 0:
-            metrics_path = os.path.join(log_path, f"metrics.json")
-            with open(metrics_path, "w") as f:
-                json.dump(metrics_history, f)
-
-    # --- Training complete ---
-    elapsed = time.time() - start_time
-    print(f"\nTraining complete!")
-    print(f"  Total time: {elapsed/3600:.2f} hours")
-    print(f"  Total steps: {global_step:,}")
-    print(f"  Total updates: {total_updates:,}")
-
-    # Final save
-    metrics_path = os.path.join(log_path, "metrics_final.json")
-    with open(metrics_path, "w") as f:
-        json.dump(metrics_history, f)
-    print(f"  Metrics saved to: {metrics_path}")
+    for i in range(_NUM_VIDEOS.value):
+        frames = infer_env_raw.render(trajectories[i][::render_every], scene_option=scene_option)
+        media.write_video(logdir / f"rollout{i}.mp4", frames, fps=fps)
+        print(f"Video saved: {logdir / f'rollout{i}.mp4'}")
 
     if writer is not None:
         writer.close()
 
 
-def evaluate(env, actor_state, actor, key, num_episodes):
-    """Run deterministic evaluation episodes (mean action, no exploration noise)."""
-    returns = []
-    for ep in range(num_episodes):
-        key, reset_key = jax.random.split(key)
-        state = env.reset(reset_key)
-        episode_return = 0.0
-
-        for _ in range(1000):
-            # Deterministic action: use mean of policy (no sampling noise)
-            mean, _ = actor.apply(actor_state.params, state.obs["state"][None])
-            action = jnp.tanh(mean[0])  # Squash to [-1, 1]
-            state = env.step(state, action)
-            episode_return += float(state.reward)
-            if state.done:
-                break
-
-        returns.append(episode_return)
-    return jnp.array(returns)
-
-
-# =========================================================================
-# Entry Point
-# =========================================================================
+def run():
+    app.run(main)
 
 if __name__ == "__main__":
-    args = parse_args()
-    train(args)
+    run()
