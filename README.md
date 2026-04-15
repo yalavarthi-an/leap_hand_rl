@@ -1,7 +1,7 @@
 # Dexterous In-Hand Cube Reorientation with the LEAP Hand
 
 **CS 5180: Reinforcement Learning, Spring 2026**
-**Author: Anish Yalavarthi**
+**Anish Yalavarthi**
 
 A comparative study of PPO and SAC in GPU-accelerated MuJoCo MJX
 for dexterous manipulation using the 16-DOF LEAP Hand.
